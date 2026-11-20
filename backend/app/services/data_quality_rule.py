@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import re
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -27,6 +28,155 @@ class DataQualityRuleService(BaseModuleService):
     def __init__(self) -> None:
         super().__init__()
         self._validation_history: list[dict[str, Any]] = []
+
+    RELEASE_MODULE = "quality_release_list"
+
+    @staticmethod
+    def build_source_row_key(source_module: str, page: int, identity: Any) -> str:
+        """按来源行身份生成稳定键，跨批次、跨续做可关联同一条来源行。"""
+        return f"{source_module}:p{page}:src{identity}"
+
+    def build_release_list(
+        self,
+        task_id: int,
+        batch_id: str,
+        page: int,
+        records: list[dict[str, Any]],
+        source_module: str = "batch_ingest",
+        identity_field: str = "id",
+    ) -> dict[str, Any]:
+        """对同页转换数据做批量校验，产出可直接使用的质检放行清单。
+
+        清单按 (任务ID, 批次号, 页码) 幂等：同页重复调用直接复用已持久化
+        的清单，保证两轮批次重叠时同一来源行只有一份放行结论。
+        每条记录同时给出可落湖结论（放行/阻断）与阻断原因，交给接入流程。
+
+        Returns:
+            { ok, 清单编号, 任务ID, 批次号, 页码, total, 放行数, 阻断数, items }
+        """
+        existing = self._find_release_list(task_id, batch_id, page)
+        if existing is not None:
+            items = existing.get("items", [])
+            return {
+                "ok": True,
+                "清单编号": existing.get("清单编号"),
+                "任务ID": task_id,
+                "批次号": batch_id,
+                "页码": page,
+                "reused": True,
+                "total": len(items),
+                "放行数": sum(1 for it in items if it["放行结论"] == "放行"),
+                "阻断数": sum(1 for it in items if it["放行结论"] == "阻断"),
+                "items": items,
+            }
+
+        items: list[dict[str, Any]] = []
+        released = 0
+        blocked = 0
+        for record in records:
+            identity = record.get(identity_field)
+            source_row_key = self.build_source_row_key(source_module, page, identity)
+            verdict = self.validate_record(record, source_module=source_module)
+            is_blocked = bool(verdict.get("blocked")) or not verdict.get("passed", True)
+            block_reasons: list[str] = []
+            if is_blocked:
+                for detail in verdict.get("details", []):
+                    if not detail.get("passed", True):
+                        block_reasons.append(
+                            f"{detail.get('rule_no')}/{detail.get('field')}: "
+                            f"{self._first_failure_message(detail)}"
+                        )
+                if not block_reasons:
+                    block_reasons.append("质量校验未通过")
+            conclusion = "阻断" if is_blocked else "放行"
+            if is_blocked:
+                blocked += 1
+            else:
+                released += 1
+            items.append({
+                "来源行身份": source_row_key,
+                "来源行标识": identity,
+                "放行结论": conclusion,
+                "阻断原因": "；".join(block_reasons),
+                "校验分数": verdict.get("score", 100),
+                "阻断策略命中": bool(verdict.get("blocked")),
+                "行数据快照": dict(record),
+                "生成时间": datetime.now(timezone.utc).isoformat(),
+            })
+
+        list_no = f"QRL-{task_id}-{page}-{uuid.uuid4().hex[:8]}"
+        persisted = json_store.insert(self.RELEASE_MODULE, {
+            "清单编号": list_no,
+            "任务ID": task_id,
+            "批次号": batch_id,
+            "页码": page,
+            "来源模块": source_module,
+            "total": len(items),
+            "放行数": released,
+            "阻断数": blocked,
+            "items": items,
+            "生成时间": datetime.now(timezone.utc).isoformat(),
+        })
+
+        return {
+            "ok": True,
+            "清单编号": list_no,
+            "清单记录ID": persisted.get("id"),
+            "任务ID": task_id,
+            "批次号": batch_id,
+            "页码": page,
+            "reused": False,
+            "total": len(items),
+            "放行数": released,
+            "阻断数": blocked,
+            "items": items,
+        }
+
+    @staticmethod
+    def _first_failure_message(detail: dict[str, Any]) -> str:
+        for key in ("expr_result", "range_result"):
+            result = detail.get(key) or {}
+            if not result.get("passed", True):
+                return str(result.get("message", "校验失败"))
+        return "校验失败"
+
+    def _find_release_list(self, task_id: int, batch_id: str, page: int) -> dict[str, Any] | None:
+        for row in json_store.get_all(self.RELEASE_MODULE):
+            if (row.get("任务ID") == task_id
+                    and row.get("批次号") == batch_id
+                    and row.get("页码") == page):
+                return row
+        return None
+
+    def get_release_lists(
+        self,
+        task_id: int | None = None,
+        batch_id: str | None = None,
+        page: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """查询质检放行清单，可按任务、批次、页码过滤。"""
+        rows = json_store.get_all(self.RELEASE_MODULE)
+        result = []
+        for row in rows:
+            if task_id is not None and row.get("任务ID") != task_id:
+                continue
+            if batch_id is not None and row.get("批次号") != batch_id:
+                continue
+            if page is not None and row.get("页码") != page:
+                continue
+            result.append(row)
+        return result
+
+    def get_release_decision(self, source_row_key: str, task_id: int | None = None) -> dict[str, Any] | None:
+        """按来源行身份查最近一次放行结论；阻断行可据此确认始终拿不到落湖回执。"""
+        latest: dict[str, Any] | None = None
+        for row in json_store.get_all(self.RELEASE_MODULE):
+            if task_id is not None and row.get("任务ID") != task_id:
+                continue
+            for item in row.get("items", []):
+                if item.get("来源行身份") == source_row_key:
+                    latest = item
+        return latest
 
     def validate_record(self, record: dict[str, Any], source_module: str = "") -> dict[str, Any]:
         """对单条记录执行质量校验。
@@ -244,5 +394,12 @@ class DataQualityRuleService(BaseModuleService):
             "abnormal": sum(1 for r in rows if r.get("abnormal")),
             "total_validations": len(self._validation_history),
             "active_rules": sum(1 for r in rows if r.get("status") == "已生效"),
+            "release_lists": len(json_store.get_all(self.RELEASE_MODULE)),
+            "released_rows": sum(
+                int(r.get("放行数", 0)) for r in json_store.get_all(self.RELEASE_MODULE)
+            ),
+            "blocked_rows": sum(
+                int(r.get("阻断数", 0)) for r in json_store.get_all(self.RELEASE_MODULE)
+            ),
             "operation": self.OPERATION_TERM,
         }

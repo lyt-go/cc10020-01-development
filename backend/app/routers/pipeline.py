@@ -26,6 +26,15 @@ class BatchExecuteRequest(BaseModel):
     max_pages: int = 5
 
 
+class QualityReleaseRequest(BaseModel):
+    task_id: int
+    batch_id: str
+    page: int
+    records: list[dict[str, Any]]
+    source_module: str = "batch_ingest"
+    identity_field: str = "id"
+
+
 class DlqReplayRequest(BaseModel):
     dlq_ids: list[int]
 
@@ -70,11 +79,73 @@ def pipeline_batch_ingest_to_lake(request: BatchExecuteRequest) -> dict[str, Any
     """链路2: 批量拉取 → 数据转换 → 质量校验 → 数据落湖。
 
     完整覆盖：batch_ingest → data_transform → data_quality_rule → data_lake_sink。
+    放行清单与接入结算清单均按来源行身份持久化，支持中断续做。
     """
     from app.services.batch_ingest import BatchIngestService
     svc = BatchIngestService()
     result = svc.execute_batch(task_id=request.task_id, max_pages=request.max_pages)
     return result
+
+
+@router.post("/quality-release-list")
+def pipeline_quality_release_list(request: QualityReleaseRequest) -> dict[str, Any]:
+    """质检放行清单：同页转换数据批量校验，返回可落湖记录与阻断原因。
+
+    完整覆盖：data_quality_rule → batch_ingest（跨模块消费）。
+    同一(任务,批次,页码)重复调用复用已持久化清单。
+    """
+    from app.services.data_quality_rule import DataQualityRuleService
+    svc = DataQualityRuleService()
+    return svc.build_release_list(
+        task_id=request.task_id,
+        batch_id=request.batch_id,
+        page=request.page,
+        records=request.records,
+        source_module=request.source_module,
+        identity_field=request.identity_field,
+    )
+
+
+@router.get("/quality-release-list")
+def pipeline_query_release_list(task_id: int, batch_id: str | None = None,
+                                page: int | None = None) -> dict[str, Any]:
+    """查询质检放行清单（可按批次、页码过滤）。"""
+    from app.services.data_quality_rule import DataQualityRuleService
+    svc = DataQualityRuleService()
+    items = svc.get_release_lists(task_id=task_id, batch_id=batch_id, page=page)
+    return {"ok": True, "total": len(items), "items": items}
+
+
+@router.get("/ingest-settlement")
+def pipeline_ingest_settlement(task_id: int, batch_id: str | None = None) -> dict[str, Any]:
+    """接入结算清单：按可写行生成，已处理数来自数据落湖实际回执。"""
+    from app.services.batch_ingest import BatchIngestService
+    svc = BatchIngestService()
+    items = svc.get_settlement_lists(task_id=task_id, batch_id=batch_id)
+    return {
+        "ok": True,
+        "total": len(items),
+        "processed": sum(int(i.get("已处理数", 0)) for i in items),
+        "blocked": sum(int(i.get("阻断数", 0)) for i in items),
+        "pending": sum(int(i.get("待处置数", 0)) for i in items),
+        "items": items,
+    }
+
+
+@router.get("/page-release-boundary")
+def pipeline_page_release_boundary(task_id: int, batch_id: str, page: int) -> dict[str, Any]:
+    """查看单页放行边界与湖里实际可用数据（放行行可用、阻断行查不到）。"""
+    from app.services.batch_ingest import BatchIngestService
+    svc = BatchIngestService()
+    return svc.get_page_release_boundary(task_id=task_id, batch_id=batch_id, page=page)
+
+
+@router.get("/source-row-reconcile")
+def pipeline_source_row_reconcile(task_id: int) -> dict[str, Any]:
+    """核对同一来源行是否累计两次、阻断行是否误入数据湖。"""
+    from app.services.batch_ingest import BatchIngestService
+    svc = BatchIngestService()
+    return svc.reconcile_source_rows(task_id=task_id)
 
 
 @router.post("/dlq-replay")

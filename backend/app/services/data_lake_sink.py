@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import uuid
 import zlib
 from datetime import datetime, timezone
 from typing import Any
@@ -27,31 +28,97 @@ class DataLakeSinkService(BaseModuleService):
     ACTION_RULES = {"提交校验": "待校验", "标记生效": "已生效", "停用配置": "已停用"}
     NEGATIVE_ACTIONS = ["停用配置"]
 
-    def __init__(self) -> None:
+    IDENTITY_MODULE = "lake_sink_identity"
+
+    def __init__(self, lake_base: str | None = None) -> None:
         super().__init__()
-        self._lake_base = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data_store", "lake")
+        if lake_base is None:
+            lake_base = os.environ.get("LAKE_BASE_DIR") or os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                "data_store", "lake",
+            )
+        self._lake_base = lake_base
         os.makedirs(self._lake_base, exist_ok=True)
         self._write_stats: dict[str, int] = {}
 
+    def find_sink_receipt(self, source_row_key: str) -> dict[str, Any] | None:
+        """按来源行身份查正式落湖回执；查不到即说明该来源行尚未落湖。"""
+        for row in json_store.get_all(self.IDENTITY_MODULE):
+            if row.get("source_row_key") == source_row_key:
+                return row
+        return None
+
+    def _register_identity(
+        self,
+        source_row_key: str | None,
+        event_id: str,
+        event_type: str,
+        receipt: dict[str, Any],
+        source_channel_id: int,
+    ) -> dict[str, Any]:
+        """登记来源行身份与落湖回执；同一身份只允许一条正式落湖记录。"""
+        if not source_row_key:
+            return receipt
+        existing = self.find_sink_receipt(source_row_key)
+        if existing is not None:
+            return {
+                "ok": True,
+                "duplicate": True,
+                "message": f"来源行 {source_row_key} 已落湖，跳过重复写入",
+                "partition": existing.get("partition", ""),
+                "file_path": existing.get("file_path", ""),
+                "record_hash": existing.get("record_hash", ""),
+                "event_id": existing.get("event_id"),
+                "source_row_key": source_row_key,
+            }
+        json_store.insert(self.IDENTITY_MODULE, {
+            "source_row_key": source_row_key,
+            "event_id": event_id,
+            "event_type": event_type,
+            "source_channel_id": source_channel_id,
+            "partition": receipt.get("partition", ""),
+            "file_path": receipt.get("file_path", ""),
+            "record_hash": receipt.get("record_hash", ""),
+            "sunk_at": datetime.now(timezone.utc).isoformat(),
+        })
+        receipt["source_row_key"] = source_row_key
+        return receipt
+
     def write_event(self, event_id: str, event_type: str, payload: dict[str, Any],
-                    source_channel_id: int = 0) -> dict[str, Any]:
+                    source_channel_id: int = 0,
+                    source_row_key: str | None = None) -> dict[str, Any]:
         """将事件数据写入数据湖。
 
         写入流程：
-        1. 确定分区路径（按日期/事件类型）
-        2. 序列化数据（默认JSON格式）
-        3. 写入分区文件
-        4. 更新写入统计
+        1. 若携带来源行身份，先查重：同一来源行只允许一条正式落湖记录
+        2. 确定分区路径（按日期/事件类型）
+        3. 序列化数据（默认JSON格式）
+        4. 写入分区文件并持久化来源行身份与回执
 
         Args:
             event_id: 事件唯一标识
             event_type: 事件类型
             payload: 事件数据
             source_channel_id: 来源通道ID
+            source_row_key: 来源行身份键，用于跨批次幂等
 
         Returns:
             { ok: bool, message: str, partition: str, file_path: str }
         """
+        if source_row_key:
+            existing = self.find_sink_receipt(source_row_key)
+            if existing is not None:
+                return {
+                    "ok": True,
+                    "duplicate": True,
+                    "message": f"来源行 {source_row_key} 已落湖，跳过重复写入",
+                    "partition": existing.get("partition", ""),
+                    "file_path": existing.get("file_path", ""),
+                    "record_hash": existing.get("record_hash", ""),
+                    "event_id": existing.get("event_id"),
+                    "source_row_key": source_row_key,
+                }
+
         now = datetime.now(timezone.utc)
         date_partition = now.strftime("%Y/%m/%d")
         partition_path = os.path.join(self._lake_base, f"events/{event_type}", date_partition)
@@ -67,8 +134,8 @@ class DataLakeSinkService(BaseModuleService):
             "record_hash": hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16],
         }
 
-        # 写入分区文件
-        file_name = f"{now.strftime('%H%M%S')}_{event_id[:8]}.json"
+        # 写入分区文件：时间戳 + 事件片段 + 随机后缀，避免同秒多事件互相覆盖
+        file_name = f"{now.strftime('%H%M%S')}_{event_id[:8]}_{uuid.uuid4().hex[:8]}.json"
         file_path = os.path.join(partition_path, file_name)
 
         try:
@@ -77,13 +144,17 @@ class DataLakeSinkService(BaseModuleService):
 
             self._write_stats[event_type] = self._write_stats.get(event_type, 0) + 1
 
-            return {
+            receipt = {
                 "ok": True,
                 "message": f"数据已写入数据湖分区 {date_partition}",
                 "partition": f"events/{event_type}/{date_partition}",
                 "file_path": file_path,
                 "record_hash": record["record_hash"],
+                "duplicate": False,
             }
+            return self._register_identity(
+                source_row_key, event_id, event_type, receipt, source_channel_id
+            )
         except OSError as e:
             return {"ok": False, "message": f"写入失败: {e}", "partition": "", "file_path": ""}
 
@@ -129,6 +200,41 @@ class DataLakeSinkService(BaseModuleService):
             }
         except OSError as e:
             return {"ok": False, "message": f"批量写入失败: {e}", "written": 0}
+
+    def find_lake_record(self, source_row_key: str) -> dict[str, Any] | None:
+        """按来源行身份核对湖里是否存在正式落湖记录。
+
+        阻断行从未调用写入，重复写入也不会产生第二份文件，因此该方法
+        对阻断身份始终返回 None，合格身份最多返回一条记录。
+        """
+        receipt = self.find_sink_receipt(source_row_key)
+        if receipt is None:
+            return None
+        file_path = receipt.get("file_path", "")
+        if not file_path or not os.path.exists(file_path):
+            return None
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return None
+        records = data if isinstance(data, list) else [data]
+        for rec in records:
+            payload = rec.get("payload", {})
+            if isinstance(payload, dict) and payload.get("_source_row_key") == source_row_key:
+                return rec
+            if rec.get("event_id") == receipt.get("event_id"):
+                return rec
+        return records[0] if records else None
+
+    def get_identity_stats(self) -> dict[str, Any]:
+        """落湖身份注册统计：用于核对同一来源行是否被累计写入两次。"""
+        rows = json_store.get_all(self.IDENTITY_MODULE)
+        return {
+            "total_identities": len(rows),
+            "unique_source_rows": len({r.get("source_row_key") for r in rows}),
+            "duplicate_skips": int(self._write_stats.get("__duplicate_skips__", 0)),
+        }
 
     def query_lake_data(self, event_type: str, date_str: str | None = None,
                         limit: int = 100) -> dict[str, Any]:
@@ -233,5 +339,6 @@ class DataLakeSinkService(BaseModuleService):
             "abnormal": sum(1 for r in rows if r.get("abnormal")),
             "lake_files": lake_stats.get("total_files", 0),
             "lake_size_mb": lake_stats.get("total_size_mb", 0),
+            "sunk_identities": len(json_store.get_all(self.IDENTITY_MODULE)),
             "operation": self.OPERATION_TERM,
         }
